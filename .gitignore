@@ -13,7 +13,4 @@ venv/
 
 # Protobuf build artifacts
 websocket-proto/
-*_pb2.py
-!PushDataV3ApiWrapper_pb2.py
-!PublicAggreBookTickerV3Api_pb2.py
 
