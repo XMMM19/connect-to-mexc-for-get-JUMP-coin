@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -32,9 +30,15 @@ import json
 import threading
 import time
 import traceback
+import signal
+import ssl
+import certifi
+STOP_EVENT = threading.Event()
 from typing import Optional
 
 import websocket  # type: ignore
+
+APP: Optional[websocket.WebSocketApp] = None
 
 # --- Configuration ---
 SYMBOL = "JUMPUSDT"  # Trading pair must be uppercase per docs
@@ -84,18 +88,36 @@ def on_message(ws: websocket.WebSocketApp, message: bytes | str) -> None:
     try:
         wrapper = PushDataV3ApiWrapper()
         wrapper.ParseFromString(message)
+        # names = [f.name for f, v in wrapper.ListFields()]
+        # print("[debug fields]", names)
         channel = getattr(wrapper, "channel", "")
         symbol = getattr(wrapper, "symbol", "")
-        # For bookTicker, the payload field is `publicbookticker`
-        pbt = getattr(wrapper, "publicbookticker", None)
-        if pbt and (pbt.bidprice or pbt.askprice):
-            print(
-                f"[bookTicker] {symbol} | bid {pbt.bidprice} x {pbt.bidquantity}  "
-                f"ask {pbt.askprice} x {pbt.askquantity}  (channel={channel})"
-            )
+
+        # Try both possible field names seen in proto: publicAggreBookTicker (camelCase) and legacy publicbookticker
+        pbt = (
+            getattr(wrapper, "publicAggreBookTicker", None)
+            or getattr(wrapper, "publicaggrebookticker", None)
+            or getattr(wrapper, "publicbookticker", None)
+        )
+
+        if pbt is not None:
+            # Handle both camelCase and snake/lowercase variants
+            bid_price = getattr(pbt, "bidPrice", None) or getattr(pbt, "bidprice", None)
+            bid_qty   = getattr(pbt, "bidQuantity", None) or getattr(pbt, "bidquantity", None)
+            ask_price = getattr(pbt, "askPrice", None) or getattr(pbt, "askprice", None)
+            ask_qty   = getattr(pbt, "askQuantity", None) or getattr(pbt, "askquantity", None)
+
+            if (bid_price is not None) or (ask_price is not None):
+                print(
+                    f"[bookTicker] {symbol} | bid {bid_price} x {bid_qty}  "
+                    f"ask {ask_price} x {ask_qty}  (channel={channel})"
+                )
+            else:
+                # Payload present but fields differ; show the raw object for inspection
+                print(f"[bookTicker raw] symbol={symbol} (channel={channel}) -> {pbt}")
         else:
             # Fallback: just show known meta fields
-            send_time = getattr(wrapper, "sendtime", None)
+            send_time = getattr(wrapper, "sendTime", None) or getattr(wrapper, "sendtime", None)
             print(f"[protobuf] channel={channel} symbol={symbol} sendtime={send_time}")
     except Exception:
         print("[error] Failed to decode protobuf message:")
@@ -110,6 +132,24 @@ def on_close(ws: websocket.WebSocketApp, code: Optional[int], reason: Optional[s
     print(f"[close] code={code} reason={reason}")
 
 
+def _handle_sigint(sig, frame):  # type: ignore[unused-argument]
+    print("\n[signal] SIGINT received. Stopping...")
+    STOP_EVENT.set()
+    # Also stop websocket-client's loop if it's currently running
+    try:
+        if APP is not None:
+            try:
+                APP.keep_running = False  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                APP.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     # Note: some environments require `websocket.enableTrace(True)` for debugging
     # websocket.enableTrace(True)
@@ -120,14 +160,20 @@ if __name__ == "__main__":
         on_error=on_error,
         on_close=on_close,
     )
+    APP = app
 
-    # Run forever with simple reconnect on unexpected exit
-    while True:
+    # Install signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    try:
+        while not STOP_EVENT.is_set():
+            app.run_forever(ping_interval=None, ping_timeout=None, sslopt={"cert_reqs": ssl.CERT_REQUIRED, "ca_certs": certifi.where()})
+            if STOP_EVENT.is_set():
+                break
+            time.sleep(1)
+    finally:
         try:
-            app.run_forever(ping_interval=None, ping_timeout=None)
-        except KeyboardInterrupt:
-            print("Interrupted by user. Bye!")
-            break
-        except Exception as e:  # noqa: BLE001
-            print("[run_forever error]", e)
-            time.sleep(3)
+            app.close()
+        except Exception:
+            pass
+        print("Interrupted by user. Bye!")
